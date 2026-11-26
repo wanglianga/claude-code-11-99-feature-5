@@ -1,342 +1,62 @@
-import { fmtDateTime, fmtTime } from './format';
+import { fmtDateTime } from './format';
 import { seedState } from './seed';
+import {
+  LANG_LABEL,
+  blockById,
+  blocksWithBrokenRefs,
+  brokenRefs,
+  currentPublication,
+  currentRefSignature,
+  isPublishedNow,
+  latestVersion,
+  liveBlocks,
+  outgoingRefs,
+  revalidateReviews,
+  releaseCheck,
+  refSignature,
+  residentById,
+  targetResidents,
+  translationOf,
+  translationReady,
+} from './selectors';
 import type {
-  Assignment,
+  Acknowledgement,
+  Block,
+  BlockRef,
   CmdCtx,
   CmdOutcome,
   Command,
-  ContactTask,
-  Family,
-  PendingConfirmation,
-  PromiseStatus,
-  ProtectionStrategy,
+  Notice,
+  NoticeState,
+  Publication,
   Receipt,
-  ReturnPromise,
+  RejectedClick,
+  Review,
   Role,
-  Room,
-  ShelterState,
+  TranslationState,
 } from './types';
 
-/** 本地模拟适配器的异步确认时延（真实毫秒） */
-export const CHECKIN_DELAY_REAL_MS = 1200;
-export const CHECKOUT_DELAY_REAL_MS = 1500;
-
-export const ROLE_LABEL: Record<Role, string> = {
-  receptionist: '接待员',
-  duty: '楼层值班员',
-  bed_manager: '床位管理员',
-};
-
-export const FAMILY_STATUS_LABEL: Record<Family['status'], string> = {
-  registered: '待安置',
-  draft: '草稿分房',
-  confirming: '入住确认中',
-  checked_in: '在场在住',
-  temp_leave: '暂离在外',
-  checked_out: '已退住',
-};
-
-export const STRATEGY_LABEL: Record<ProtectionStrategy, string> = {
-  keep_room: '原房原床保留',
-  capacity: '容量保护（返所换房）',
-};
-
-export const PROMISE_STATUS_LABEL: Record<PromiseStatus, string> = {
-  active: '有效',
-  fulfilled: '已兑现',
-  expired_contact: '已逾期·联系核实中',
-  cancelled: '已取消',
-};
+/** 本地模拟适配器的投递时延（真实毫秒），不调用真实短信服务 */
+export const DELIVERY_DELAY_REAL_MS = 1500;
 
 const PERMS: Record<Command['type'], Role[] | 'any'> = {
-  RegisterFamily: ['receptionist'],
-  CreateDraft: ['receptionist'],
-  CancelDraft: ['receptionist'],
-  SubmitCheckIn: ['receptionist'],
-  RegisterLeave: ['receptionist'],
-  ConfirmReturn: ['receptionist'],
-  ExtendPromise: ['duty'],
-  SubmitCheckout: ['duty'],
-  AddTaskNote: ['duty'],
-  CloseRoom: ['bed_manager'],
-  ReopenRoom: ['bed_manager'],
+  CreateNotice: ['receptionist'],
+  ReviseBlock: ['receptionist'],
+  ReorderBlocks: ['receptionist'],
+  DeleteBlock: ['receptionist'],
+  SetBlockRefs: ['receptionist'],
+  SwitchReviewMode: ['receptionist'],
+  SaveTranslation: ['translator'],
+  SubmitWholeReview: ['translator'],
+  SubmitBlockReview: ['translator'],
+  Publish: ['duty'],
+  Withdraw: ['duty'],
+  ResidentAck: ['resident'],
+  MoveOutFamily: ['receptionist', 'duty'],
   AdvanceClock: 'any',
+  SweepDeliveries: 'any',
   ResetDemo: 'any',
-  FinalizeDue: 'any',
 };
-
-// ---------------------------------------------------------------------------
-// 派生计算（纯函数，UI 与引擎共用同一口径）
-// ---------------------------------------------------------------------------
-
-export function familyById(state: ShelterState, id: string): Family {
-  const f = state.families.find((x) => x.id === id);
-  if (!f) throw new Error(`家庭不存在: ${id}`);
-  return f;
-}
-
-export function roomById(state: ShelterState, id: string): Room {
-  const r = state.rooms.find((x) => x.id === id);
-  if (!r) throw new Error(`房间不存在: ${id}`);
-  return r;
-}
-
-export interface RoomBuckets {
-  capacity: number;
-  /** 实际在场（已确认入住） */
-  present: number;
-  /** 入住确认中（已预占，未计入在场） */
-  confirming: number;
-  /** 保护中（有效返所承诺占用） */
-  protected: number;
-  /** 草稿占用（仅展示，不参与分配） */
-  drafts: number;
-  /** 可分配 = 容量 - 在场 - 确认中 - 保护中 */
-  allocatable: number;
-}
-
-export function roomBuckets(state: ShelterState, roomId: string): RoomBuckets {
-  const room = roomById(state, roomId);
-  let present = 0;
-  let confirming = 0;
-  let protectedBeds = 0;
-  let drafts = 0;
-  for (const f of state.families) {
-    if (f.status === 'checked_in' && f.currentRoomId === roomId) present += f.size;
-  }
-  for (const a of state.assignments) {
-    if (a.roomId !== roomId) continue;
-    if (a.status === 'confirming') confirming += a.beds;
-    else if (a.status === 'draft_open') drafts += a.beds;
-  }
-  for (const p of state.promises) {
-    if (p.roomId === roomId && (p.status === 'active' || p.status === 'expired_contact')) {
-      protectedBeds += p.beds;
-    }
-  }
-  const allocatable =
-    room.status === 'open' ? Math.max(0, room.capacity - present - confirming - protectedBeds) : 0;
-  return { capacity: room.capacity, present, confirming, protected: protectedBeds, drafts, allocatable };
-}
-
-/** 有效返所承诺（含逾期未归仍受保护的） */
-export function activePromiseOf(state: ShelterState, familyId: string): ReturnPromise | undefined {
-  return state.promises.find(
-    (p) => p.familyId === familyId && (p.status === 'active' || p.status === 'expired_contact'),
-  );
-}
-
-export function openDraftOf(state: ShelterState, familyId: string): Assignment | undefined {
-  return state.assignments.find((a) => a.familyId === familyId && a.status === 'draft_open');
-}
-
-export function latestStaleDraftOf(state: ShelterState, familyId: string): Assignment | undefined {
-  const list = state.assignments.filter((a) => a.familyId === familyId && a.status === 'draft_stale');
-  return list.sort((a, b) => b.createdAt - a.createdAt)[0];
-}
-
-export function pendingOf(
-  state: ShelterState,
-  familyId: string,
-  kind?: PendingConfirmation['kind'],
-): PendingConfirmation | undefined {
-  return state.pending.find((p) => p.familyId === familyId && (!kind || p.kind === kind));
-}
-
-export function openTaskOf(state: ShelterState, familyId: string): ContactTask | undefined {
-  return state.contactTasks.find((t) => t.familyId === familyId && t.status === 'open');
-}
-
-/**
- * 房间资格核验：容量、整组不可拆、无障碍、共房同意须同时满足。
- * 返回问题列表，空数组表示可分配。extraProtected 用于关房重规划的模拟。
- */
-export function eligibility(
-  state: ShelterState,
-  family: Family,
-  room: Room,
-  extraProtected?: Record<string, number>,
-): string[] {
-  const issues: string[] = [];
-  if (room.status !== 'open') issues.push(`房间${room.name}已临时关闭`);
-  if (family.size > room.capacity)
-    issues.push(`整组${family.size}人超过${room.name}容量${room.capacity}床，家庭不可拆分`);
-  if (family.needsAccessible && !room.accessible)
-    issues.push(`需要无障碍设施，${room.name}为普通房`);
-  const b = roomBuckets(state, room.id);
-  const extra = extraProtected?.[room.id] ?? 0;
-  const avail = room.capacity - b.present - b.confirming - b.protected - extra;
-  if (family.size > avail)
-    issues.push(
-      `${room.name}可分配${Math.max(0, avail)}床 < ${family.size}人（在场${b.present}/确认中${b.confirming}/保护中${b.protected + extra}）`,
-    );
-  const others = new Set<string>();
-  for (const f of state.families) {
-    if (f.status === 'checked_in' && f.currentRoomId === room.id && f.id !== family.id) others.add(f.id);
-  }
-  for (const p of state.promises) {
-    if (
-      p.roomId === room.id &&
-      (p.status === 'active' || p.status === 'expired_contact') &&
-      p.familyId !== family.id
-    )
-      others.add(p.familyId);
-  }
-  for (const a of state.assignments) {
-    if (a.roomId === room.id && a.status === 'confirming' && a.familyId !== family.id) others.add(a.familyId);
-  }
-  if (others.size > 0) {
-    if (!family.coRoomConsent) issues.push(`家庭未同意共房，${room.name}内已有其他家庭或返所保护`);
-    for (const oid of others) {
-      const of = state.families.find((f) => f.id === oid);
-      if (of && !of.coRoomConsent) issues.push(`${room.name}内「${of.name}」未同意共房`);
-    }
-  }
-  return issues;
-}
-
-/** 候选房间列表：可分配的排前，其次无障碍匹配，再按可分配床数排序 */
-export function suggestRooms(
-  state: ShelterState,
-  family: Family,
-): { room: Room; issues: string[] }[] {
-  return state.rooms
-    .map((room) => ({ room, issues: eligibility(state, family, room) }))
-    .sort((a, b) => {
-      const ae = a.issues.length === 0 ? 0 : 1;
-      const be = b.issues.length === 0 ? 0 : 1;
-      if (ae !== be) return ae - be;
-      const am = a.room.accessible === family.needsAccessible ? 0 : 1;
-      const bm = b.room.accessible === family.needsAccessible ? 0 : 1;
-      if (am !== bm) return am - bm;
-      return roomBuckets(state, b.room.id).allocatable - roomBuckets(state, a.room.id).allocatable;
-    });
-}
-
-/** 单条承诺当前是否仍能按家庭整组兑现 */
-export function promiseIssues(state: ShelterState, p: ReturnPromise): string[] {
-  const fam = familyById(state, p.familyId);
-  const room = state.rooms.find((r) => r.id === p.roomId);
-  if (!room) return ['保护房间不存在'];
-  const issues: string[] = [];
-  if (room.status !== 'open') issues.push(`保护房间${room.name}已临时关闭`);
-  if (fam.needsAccessible && !room.accessible)
-    issues.push(`${fam.name}需要无障碍设施，${room.name}不具备`);
-  const others = new Set<string>();
-  for (const f of state.families) {
-    if (f.status === 'checked_in' && f.currentRoomId === room.id && f.id !== fam.id) others.add(f.id);
-  }
-  for (const q of state.promises) {
-    if (q.id !== p.id && q.roomId === room.id && (q.status === 'active' || q.status === 'expired_contact'))
-      others.add(q.familyId);
-  }
-  for (const a of state.assignments) {
-    if (a.roomId === room.id && a.status === 'confirming' && a.familyId !== fam.id) others.add(a.familyId);
-  }
-  if (others.size > 0) {
-    if (!fam.coRoomConsent) issues.push(`${fam.name}未同意共房`);
-    for (const oid of others) {
-      const of = state.families.find((f) => f.id === oid);
-      if (of && !of.coRoomConsent) issues.push(`${room.name}内「${of.name}」未同意共房`);
-    }
-  }
-  const b = roomBuckets(state, room.id);
-  if (b.present + b.confirming + b.protected > room.capacity) issues.push(`${room.name}容量被突破`);
-  return issues;
-}
-
-export interface InvariantResult {
-  name: string;
-  ok: boolean;
-  detail: string;
-}
-
-/** 全所核对：家庭唯一位置、容量、承诺可兑现、人数口径一致、不自动搬动 */
-export function checkInvariants(state: ShelterState): InvariantResult[] {
-  const results: InvariantResult[] = [];
-
-  const locBad: string[] = [];
-  for (const f of state.families) {
-    const activeAssign = state.assignments.filter(
-      (a) => a.familyId === f.id && (a.status === 'active' || a.status === 'confirming'),
-    );
-    const activeProm = state.promises.filter(
-      (p) => p.familyId === f.id && (p.status === 'active' || p.status === 'expired_contact'),
-    );
-    if (f.status === 'checked_in' && activeAssign.length !== 1)
-      locBad.push(`${f.name}:在住但有效入住记录=${activeAssign.length}`);
-    if (f.status === 'confirming' && activeAssign.length !== 1)
-      locBad.push(`${f.name}:确认中但记录=${activeAssign.length}`);
-    if (f.status === 'temp_leave' && activeProm.length !== 1)
-      locBad.push(`${f.name}:暂离但有效承诺=${activeProm.length}`);
-    if (f.status === 'temp_leave' && activeAssign.length > 0)
-      locBad.push(`${f.name}:暂离却仍有入住记录`);
-    if ((f.status === 'checked_in' || f.status === 'confirming') && activeProm.length > 0)
-      locBad.push(`${f.name}:在场却仍有返所承诺`);
-    if (
-      (f.status === 'registered' || f.status === 'draft' || f.status === 'checked_out') &&
-      (activeAssign.length > 0 || activeProm.length > 0)
-    )
-      locBad.push(`${f.name}:${FAMILY_STATUS_LABEL[f.status]}却仍有床位记录`);
-  }
-  results.push({
-    name: '家庭唯一位置',
-    ok: locBad.length === 0,
-    detail: locBad.join('；') || '每个家庭在任一时刻只有一个确定位置（在住房间 / 暂离承诺 / 待安置）',
-  });
-
-  const capBad = state.rooms
-    .map((r) => ({ r, b: roomBuckets(state, r.id) }))
-    .filter((x) => x.b.present + x.b.confirming + x.b.protected > x.r.capacity)
-    .map(
-      (x) =>
-        `${x.r.name}: 在场${x.b.present}+确认中${x.b.confirming}+保护${x.b.protected} > 容量${x.r.capacity}`,
-    );
-  results.push({
-    name: '房间容量不被突破',
-    ok: capBad.length === 0,
-    detail: capBad.join('；') || '所有房间：在场 + 确认中 + 保护中 ≤ 容量',
-  });
-
-  const promBad: string[] = [];
-  for (const p of state.promises) {
-    if (p.status !== 'active' && p.status !== 'expired_contact') continue;
-    const iss = promiseIssues(state, p);
-    if (iss.length) promBad.push(`${familyById(state, p.familyId).name}: ${iss.join('、')}`);
-  }
-  results.push({
-    name: '返所承诺可按家庭整组兑现',
-    ok: promBad.length === 0,
-    detail: promBad.join('；') || '全部有效承诺的保护容量完整、房间资格满足',
-  });
-
-  const byFam = state.families.filter((f) => f.status === 'checked_in').reduce((s, f) => s + f.size, 0);
-  const byRoom = state.rooms.reduce((s, r) => s + roomBuckets(state, r.id).present, 0);
-  results.push({
-    name: '实际在场人数一致',
-    ok: byFam === byRoom,
-    detail: `家庭口径 ${byFam} 人 ＝ 房间口径 ${byRoom} 人`,
-  });
-
-  const moveBad = state.families
-    .filter((f) => f.status === 'checked_in')
-    .filter((f) => {
-      const a = state.assignments.find((x) => x.familyId === f.id && x.status === 'active');
-      return !a || a.roomId !== f.currentRoomId;
-    })
-    .map((f) => f.name);
-  results.push({
-    name: '已入住家庭未被自动搬动',
-    ok: moveBad.length === 0,
-    detail: moveBad.length ? `异常：${moveBad.join('、')}` : '在住家庭的入住记录与其房间一致，系统不做自动搬动',
-  });
-
-  return results;
-}
-
-// ---------------------------------------------------------------------------
-// 命令处理（在调用方提供的 IndexedDB 事务内同步执行）
-// ---------------------------------------------------------------------------
 
 function uid(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -344,14 +64,14 @@ function uid(): string {
     : `id-${Math.random().toString(36).slice(2)}`;
 }
 
-function clone(s: ShelterState): ShelterState {
+function clone(s: NoticeState): NoticeState {
   return structuredClone(s);
 }
 
 type ReceiptSink = (kind: string, summary: string, lines?: string[], extra?: Partial<Receipt>) => Receipt;
 
 function addReceipt(
-  state: ShelterState,
+  state: NoticeState,
   kind: string,
   actor: string,
   summary: string,
@@ -361,60 +81,62 @@ function addReceipt(
   const seq = ++state.seqCounter;
   const r: Receipt = { seq, id: `R${seq}`, at: state.virtualNow, kind, actor, summary, lines, ...extra };
   state.receipts.push(r);
-  if (state.receipts.length > 500) state.receipts.splice(0, state.receipts.length - 500);
+  if (state.receipts.length > 600) state.receipts.splice(0, state.receipts.length - 600);
   return r;
 }
 
-function summarize(state: ShelterState, cmd: Command): string {
-  const famName = (id: string) => state.families.find((f) => f.id === id)?.name ?? id;
-  const roomName = (id: string) => state.rooms.find((r) => r.id === id)?.name ?? id;
+function summarize(cmd: Command): string {
   switch (cmd.type) {
-    case 'RegisterFamily':
-      return `登记家庭「${cmd.input.name}」`;
-    case 'CreateDraft':
-      return `草稿分房 ${famName(cmd.familyId)} → ${roomName(cmd.roomId)}`;
-    case 'CancelDraft':
-      return '取消草稿';
-    case 'SubmitCheckIn':
-      return '提交入住确认';
-    case 'RegisterLeave':
-      return `暂离登记 ${famName(cmd.familyId)}`;
-    case 'ConfirmReturn':
-      return `返所确认 ${famName(cmd.familyId)}`;
-    case 'ExtendPromise':
-      return `承诺延期 ${famName(cmd.familyId)}`;
-    case 'SubmitCheckout':
-      return `核实退住 ${famName(cmd.familyId)}`;
-    case 'AddTaskNote':
-      return '联系任务备注';
-    case 'CloseRoom':
-      return `临时关闭房间 ${roomName(cmd.roomId)}`;
-    case 'ReopenRoom':
-      return `重开房间 ${roomName(cmd.roomId)}`;
+    case 'CreateNotice':
+      return `新建通知「${cmd.input.title}」`;
+    case 'ReviseBlock':
+      return '修订区块源文';
+    case 'ReorderBlocks':
+      return '区块换序';
+    case 'DeleteBlock':
+      return '删除区块';
+    case 'SetBlockRefs':
+      return '登记/修复区块引用';
+    case 'SaveTranslation':
+      return '保存译文';
+    case 'SubmitWholeReview':
+      return '整份审阅';
+    case 'SubmitBlockReview':
+      return '区块审阅';
+    case 'Publish':
+      return '发布通知';
+    case 'Withdraw':
+      return '撤回通知';
+    case 'ResidentAck':
+      return cmd.kind === 'assist' ? '住户提交协助请求' : '住户确认知悉';
+    case 'MoveOutFamily':
+      return '家庭迁出';
     case 'AdvanceClock':
       return '推进演示时间';
+    case 'SweepDeliveries':
+      return '投递适配器结算';
     case 'ResetDemo':
       return '重置演示数据';
-    case 'FinalizeDue':
-      return '异步确认结算';
+    default:
+      return cmd.type;
   }
 }
 
-export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): CmdOutcome {
+export function applyCommand(prev: NoticeState, cmd: Command, ctx: CmdCtx): CmdOutcome {
   if (cmd.type === 'ResetDemo') {
     const fresh = seedState();
-    const r = addReceipt(fresh, 'reset', ROLE_LABEL[ctx.role], '演示数据已重置为初始场景', []);
+    const r = addReceipt(fresh, 'reset', roleLabel(ctx.role), '演示数据已重置为初始场景');
     return { state: fresh, receipts: [r], changed: true };
   }
 
-  // 幂等：同一 commandId 只生效一次，重复提交返回重复回执
+  // 幂等：同一 commandId 只生效一次
   const seen = prev.commandLog.find((e) => e.commandId === cmd.commandId);
   if (seen) {
     const state = clone(prev);
     const r = addReceipt(
       state,
       'duplicate_submission',
-      ROLE_LABEL[ctx.role],
+      roleLabel(ctx.role),
       `重复提交已幂等忽略：${seen.summary}`,
       [`原回执：${seen.receiptIds.join('、') || '（无）'}`, '同一 commandId 的命令只会生效一次，状态未发生变化'],
       { duplicateOf: seen.receiptIds[0] },
@@ -426,14 +148,12 @@ export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): Cmd
   const state = clone(prev);
   const receipts: Receipt[] = [];
   const R: ReceiptSink = (kind, summary, lines = [], extra) => {
-    const r = addReceipt(state, kind, ROLE_LABEL[ctx.role], summary, lines, extra);
+    const r = addReceipt(state, kind, roleLabel(ctx.role), summary, lines, extra);
     receipts.push(r);
     return r;
   };
 
   const error = dispatch(state, cmd, ctx, R);
-  // 每次变更后重核所有有效草稿：失效草稿保留输入并说明冲突
-  revalidateDrafts(state, R);
 
   const mutated = receipts.length > 0 || !!error;
   if (!mutated) return { state: prev, receipts: [], changed: false };
@@ -443,525 +163,720 @@ export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): Cmd
     commandId: cmd.commandId,
     at: state.virtualNow,
     ok: !error,
-    summary: summarize(state, cmd),
+    summary: summarize(cmd),
     receiptIds: receipts.map((r) => r.id),
   });
   if (state.commandLog.length > 300) state.commandLog.splice(0, state.commandLog.length - 300);
   return { state, receipts, error, changed: true };
 }
 
-function dispatch(state: ShelterState, cmd: Command, ctx: CmdCtx, R: ReceiptSink): string | undefined {
+function roleLabel(role: Role): string {
+  const map: Record<Role, string> = {
+    receptionist: '接待员',
+    translator: '翻译志愿者',
+    duty: '值班负责人',
+    resident: '住户',
+  };
+  return map[role];
+}
+
+function dispatch(state: NoticeState, cmd: Command, ctx: CmdCtx, R: ReceiptSink): string | undefined {
   const perm = PERMS[cmd.type];
   if (perm !== 'any' && !perm.includes(ctx.role)) {
-    return `当前角色（${ROLE_LABEL[ctx.role]}）无权执行此操作，需要：${perm.map((r) => ROLE_LABEL[r]).join('或')}`;
+    return `当前角色（${roleLabel(ctx.role)}）无权执行此操作，需要：${perm.map(roleLabel).join('或')}`;
   }
   switch (cmd.type) {
-    case 'RegisterFamily':
-      return hRegisterFamily(state, cmd, R);
-    case 'CreateDraft':
-      return hCreateDraft(state, cmd, R);
-    case 'CancelDraft':
-      return hCancelDraft(state, cmd, R);
-    case 'SubmitCheckIn':
-      return hSubmitCheckIn(state, cmd, ctx, R);
-    case 'RegisterLeave':
-      return hRegisterLeave(state, cmd, R);
-    case 'ConfirmReturn':
-      return hConfirmReturn(state, cmd, R);
-    case 'ExtendPromise':
-      return hExtendPromise(state, cmd, R);
-    case 'SubmitCheckout':
-      return hSubmitCheckout(state, cmd, ctx, R);
-    case 'AddTaskNote':
-      return hAddTaskNote(state, cmd, R);
-    case 'CloseRoom':
-      return hCloseRoom(state, cmd, R);
-    case 'ReopenRoom':
-      return hReopenRoom(state, cmd, R);
+    case 'CreateNotice':
+      return hCreateNotice(state, cmd, R);
+    case 'ReviseBlock':
+      return hReviseBlock(state, cmd, R);
+    case 'ReorderBlocks':
+      return hReorder(state, cmd, R);
+    case 'DeleteBlock':
+      return hDeleteBlock(state, cmd, R);
+    case 'SetBlockRefs':
+      return hSetRefs(state, cmd, R);
+    case 'SwitchReviewMode':
+      return hSwitchMode(state, cmd, R);
+    case 'SaveTranslation':
+      return hSaveTranslation(state, cmd, R);
+    case 'SubmitWholeReview':
+      return hWholeReview(state, cmd, R);
+    case 'SubmitBlockReview':
+      return hBlockReview(state, cmd, R);
+    case 'Publish':
+      return hPublish(state, cmd, ctx, R);
+    case 'Withdraw':
+      return hWithdraw(state, cmd, R);
+    case 'ResidentAck':
+      return hResidentAck(state, cmd, R);
+    case 'MoveOutFamily':
+      return hMoveOut(state, cmd, R);
     case 'AdvanceClock':
-      return hAdvanceClock(state, cmd, R);
-    case 'FinalizeDue':
-      return hFinalizeDue(state, ctx, R);
+      return hAdvance(state, cmd, R);
+    case 'SweepDeliveries':
+      return hSweep(state, ctx, R);
     default:
       return '未知命令';
   }
 }
 
+function getNotice(state: NoticeState, noticeId: string): Notice | undefined {
+  return state.notices.find((n) => n.id === noticeId);
+}
+
+function editable(notice: Notice): boolean {
+  return notice.status !== 'published';
+}
+
 // ---------------------------------------------------------------------------
-// 各命令处理器：返回错误文案（可能已附带状态变更，如草稿失效标记），undefined 表示成功
+// 接待员：源文编辑
 // ---------------------------------------------------------------------------
 
-function hRegisterFamily(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'RegisterFamily' }>,
+function hCreateNotice(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'CreateNotice' }>,
   R: ReceiptSink,
 ): string | undefined {
-  const { name, size, needsAccessible, coRoomConsent, consentRoomChange } = cmd.input;
-  if (!name.trim()) return '家庭名称不能为空';
-  if (!Number.isInteger(size) || size < 1 || size > 20) return '家庭人数须为 1-20 的整数';
-  const fam: Family = {
+  const { title, targetType, targetId, blocks: blockInputs, refIndices } = cmd.input;
+  if (!title.trim()) return '通知标题不能为空';
+  if (blockInputs.length === 0) return '通知至少需要一个区块';
+  const targetOk =
+    targetType === 'building'
+      ? state.buildings.some((b) => b.id === targetId)
+      : state.families.some((f) => f.id === targetId);
+  if (!targetOk) return '投递目标不存在';
+
+  const blocks: Block[] = blockInputs.map((b, i) => ({
     id: uid(),
-    name: name.trim(),
-    size,
-    needsAccessible,
-    coRoomConsent,
-    consentRoomChange,
-    status: 'registered',
-  };
-  state.families.push(fam);
-  R('family_registered', `已登记：${fam.name}（${fam.size}人）`, [
-    `无障碍需求：${needsAccessible ? '需要' : '不需要'}；共房：${coRoomConsent ? '同意' : '不同意'}；返所换房：${consentRoomChange ? '同意' : '不同意'}`,
-    '家庭已加入待安置列表，可创建分房草稿（草稿不占正式床位）',
-  ]);
-  return undefined;
-}
+    kind: b.kind,
+    order: i,
+    deleted: false,
+    versions: [{ version: 1, text: b.text, revisedAt: state.virtualNow }],
+  }));
+  const idSet = new Set(blocks.map((b) => b.id));
+  const cleanRefs: BlockRef[] = refIndices
+    .filter(([fi, ti]) => fi >= 0 && ti >= 0 && fi < blocks.length && ti < blocks.length && fi !== ti)
+    .map(([fi, ti]) => ({ fromBlockId: blocks[fi].id, toBlockId: blocks[ti].id }));
 
-function hCreateDraft(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'CreateDraft' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'registered')
-    return `当前状态（${FAMILY_STATUS_LABEL[fam.status]}）不能创建分房草稿`;
-  if (openDraftOf(state, fam.id)) return '该家庭已存在未处理的草稿';
-  const room = roomById(state, cmd.roomId);
-  const issues = eligibility(state, fam, room);
-  if (issues.length) return `草稿未通过资格核验：${issues.join('；')}`;
-  const a: Assignment = {
-    id: uid(),
-    familyId: fam.id,
-    roomId: room.id,
-    beds: fam.size,
-    kind: 'draft',
-    status: 'draft_open',
-    createdAt: state.virtualNow,
-  };
-  state.assignments.push(a);
-  fam.status = 'draft';
-  R('draft_created', `草稿分房：${fam.name}（${fam.size}人）→ ${room.name}房`, [
-    '草稿不占正式床位，现场入住确认后才计入实际在场人数',
-  ]);
-  return undefined;
-}
-
-function hCancelDraft(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'CancelDraft' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const a = state.assignments.find((x) => x.id === cmd.assignmentId);
-  if (!a || (a.status !== 'draft_open' && a.status !== 'draft_stale')) return '草稿不存在或已不可取消';
-  const fam = familyById(state, a.familyId);
-  a.status = 'draft_cancelled';
-  if (fam.status === 'draft') fam.status = 'registered';
-  R('draft_cancelled', `草稿已取消：${fam.name}`, []);
-  return undefined;
-}
-
-function hSubmitCheckIn(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'SubmitCheckIn' }>,
-  ctx: CmdCtx,
-  R: ReceiptSink,
-): string | undefined {
-  const a = state.assignments.find((x) => x.id === cmd.assignmentId);
-  if (!a) return '草稿不存在';
-  const fam = familyById(state, a.familyId);
-  if (a.status === 'draft_stale')
-    return `草稿已失效：${a.conflictReason ?? ''}。原输入已保留在失效草稿中，可修改后重新创建。`;
-  if (a.status !== 'draft_open') return '该草稿当前状态不能提交入住确认';
-  const room = roomById(state, a.roomId);
-  // 提交时在事务内重新核对房间资格（并发下另一标签可能已先占床）
-  const issues = eligibility(state, fam, room);
-  if (issues.length) {
-    a.status = 'draft_stale';
-    a.conflictReason = issues.join('；');
-    if (fam.status === 'draft') fam.status = 'registered';
-    R('draft_stale', `草稿失效：${fam.name} → ${room.name}房`, [
-      `冲突原因：${a.conflictReason}`,
-      '草稿输入已保留，可在床位变化后重试或改房',
-    ]);
-    return `提交时事务重核未通过：${a.conflictReason}`;
+  const translations: Record<string, TranslationState[]> = {};
+  for (const b of blocks) {
+    translations[b.id] = state.languages.map((lang) => ({
+      lang,
+      text: '',
+      basedOnSourceVersion: 0,
+      editedAt: state.virtualNow,
+    }));
   }
-  a.status = 'confirming';
-  fam.status = 'confirming';
-  state.pending.push({
+  const notice: Notice = {
     id: uid(),
-    kind: 'checkin',
-    familyId: fam.id,
-    assignmentId: a.id,
-    submittedAtReal: ctx.realNow,
-    resolveAtReal: ctx.realNow + CHECKIN_DELAY_REAL_MS,
-    atVirtual: state.virtualNow,
-    actor: ctx.role,
-  });
+    title: title.trim(),
+    reviewMode: 'block',
+    targetType,
+    targetId,
+    status: 'draft',
+    blocks,
+    refs: cleanRefs,
+    translations,
+    reviews: [],
+    publications: [],
+    createdAt: state.virtualNow,
+    updatedAt: state.virtualNow,
+  };
+  state.notices.push(notice);
+  R('notice_created', `已新建通知「${notice.title}」（${blocks.length} 个区块，${state.languages.length} 种必需语言）`, [
+    `引用登记：${cleanRefs.length} 条`,
+    '新建通知默认走「区块审阅」；可在通知内切换为整份审阅（切换会清空当前审阅结论）',
+  ]);
+  return undefined;
+}
+
+/** 切换审阅工作流（接待员）：由专用命令承载，避免在 UI 里直接改状态 */
+export function switchReviewMode(notice: Notice, mode: Notice['reviewMode']): void {
+  if (notice.reviewMode === mode) return;
+  notice.reviewMode = mode;
+  notice.reviews = [];
+}
+
+function hSwitchMode(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'SwitchReviewMode' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (!editable(notice)) return '通知已发布，请先撤回再切换审阅模式';
+  if (notice.reviewMode === cmd.mode) return '通知已是该审阅模式';
+  const from = notice.reviewMode === 'whole' ? '整份审阅' : '区块审阅';
+  const to = cmd.mode === 'whole' ? '整份审阅' : '区块审阅';
+  switchReviewMode(notice, cmd.mode);
+  R('review_mode_switched', `审阅模式已由「${from}」切换为「${to}」`, [
+    '切换会清空现有审阅结论，须按新模式重新组织审阅；源文、译文与版本历史保留',
+  ]);
+  return undefined;
+}
+
+function hReviseBlock(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'ReviseBlock' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (!editable(notice)) return '通知处于已发布状态，请先撤回再修订源文';
+  const block = blockById(notice, cmd.blockId);
+  if (!block || block.deleted) return '区块不存在或已删除';
+  const text = cmd.text.trim();
+  if (!text) return '修订内容不能为空';
+  if (text === block.versions[block.versions.length - 1].text) return '内容与当前源文一致，无需修订';
+  const prevVersion = latestVersion(block);
+  block.versions.push({ version: prevVersion + 1, text, revisedAt: state.virtualNow });
+  notice.updatedAt = state.virtualNow;
+  revalidateReviews(notice);
+  const impacted = impactedReviews(notice);
   R(
-    'checkin_submitted',
-    `入住确认已提交：${fam.name}（${fam.size}人）→ ${room.name}房`,
-    ['本地模拟适配器进行异步现场核实（约1秒），完成后才计入实际在场人数；确认中床位已预占'],
-    { pending: true },
+    'block_revised',
+    `区块源文已修订：v${prevVersion} → v${prevVersion + 1}`,
+    [
+      `旧版本完整保留（可追溯 09:00→10:00 等历次修改），译文不会自动跟随，须由翻译志愿者按新版源文更新`,
+      `审阅有效性凭源文版本判定，本次共令 ${impacted} 条审阅结论失效（${notice.reviewMode === 'whole' ? '整份审阅：各语言均须重审整份' : '区块审阅：本区块及引用它的区块须重审，无关区块译文可沿用'}）`,
+    ],
   );
   return undefined;
 }
 
-function hRegisterLeave(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'RegisterLeave' }>,
+function impactedReviews(notice: Notice): number {
+  return notice.reviews.filter((r) => r.status === 'stale').length;
+}
+
+function hReorder(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'ReorderBlocks' }>,
   R: ReceiptSink,
 ): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'checked_in') return '仅在场在住家庭可登记暂离';
-  if (pendingOf(state, fam.id, 'checkout')) return '退住核实进行中，不能登记暂离';
-  if (cmd.expectedReturnAt <= state.virtualNow) return '预计返所时间须晚于当前演示时间';
-  const originRoom = roomById(state, fam.currentRoomId!);
-  const endActive = (reason: string) => {
-    const a = state.assignments.find((x) => x.familyId === fam.id && x.status === 'active');
-    if (a) {
-      a.status = 'ended';
-      a.endedAt = state.virtualNow;
-      a.endReason = reason;
-    }
-  };
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (!editable(notice)) return '通知已发布，请先撤回再调整区块顺序';
+  const live = liveBlocks(notice);
+  const want = [...cmd.orderedBlockIds].sort();
+  const have = live.map((b) => b.id).sort();
+  if (want.length !== have.length || want.some((id, i) => id !== have[i]))
+    return '换序列表必须恰好包含当前全部有效区块';
+  live.forEach((b, i) => {
+    const idx = cmd.orderedBlockIds.indexOf(b.id);
+    b.order = idx;
+  });
+  revalidateReviews(notice);
+  const wholeStale = notice.reviewMode === 'whole' && notice.reviews.some((r) => r.status === 'stale');
+  R('blocks_reordered', '区块顺序已调整', [
+    wholeStale
+      ? '整份审阅绑定了批准时的区块顺序，换序后整份审阅失效，须重审整份'
+      : '区块审阅以单区块为单位，换序不影响各区块已获批的审阅结论',
+  ]);
+  return undefined;
+}
 
-  if (cmd.strategy === 'keep_room') {
-    endActive('暂离（原房原床保留）');
-    const p: ReturnPromise = {
-      id: uid(),
-      familyId: fam.id,
-      strategy: 'keep_room',
-      roomId: originRoom.id,
-      originRoomId: originRoom.id,
-      beds: fam.size,
-      expectedReturnAt: cmd.expectedReturnAt,
-      status: 'active',
-      createdAt: state.virtualNow,
-    };
-    state.promises.push(p);
-    fam.status = 'temp_leave';
-    fam.currentRoomId = undefined;
-    R('leave_registered', `暂离登记：${fam.name}（${fam.size}人）外出，预计 ${fmtTime(cmd.expectedReturnAt)} 返所`, [
-      `原房${originRoom.name}原床保留 ${fam.size} 床（保护中，不参与分配）`,
-      '实际在场人数已减少，但住宿关系未结束，返所权保持有效',
+function hDeleteBlock(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'DeleteBlock' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (!editable(notice)) return '通知已发布，请先撤回再删除区块';
+  const block = blockById(notice, cmd.blockId);
+  if (!block || block.deleted) return '区块不存在或已删除';
+  block.deleted = true;
+  // 重排剩余有效区块，保持顺序连续（换序/删除后组合仍完整可理解）
+  liveBlocks(notice).forEach((b, i) => {
+    b.order = i;
+  });
+  notice.updatedAt = state.virtualNow;
+  revalidateReviews(notice);
+  const broken = blocksWithBrokenRefs(notice);
+  const lines: string[] = [
+    '区块已逻辑删除（版本与译文保留可追溯），不再进入发布组合',
+  ];
+  if (broken.has(block.id) || broken.size > 0) {
+    lines.push(
+      `存在引用该区块的其他区块（${[...broken].map((id) => kindName(notice, id)).join('、')}），已标记为「待修复引用」，修复前不能发布，不会发出残缺指示`,
+    );
+  }
+  R('block_deleted', `已删除区块「${kindName(notice, block.id)}」`, lines);
+  return undefined;
+}
+
+function kindName(notice: Notice, blockId: string): string {
+  const b = blockById(notice, blockId);
+  if (!b) return blockId;
+  const map = { subject: '主题/服务联系人', time_place: '时间地点', action: '行动说明' } as const;
+  return map[b.kind];
+}
+
+function hSetRefs(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'SetBlockRefs' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (!editable(notice)) return '通知已发布，请先撤回再调整引用';
+  const liveIds = new Set(liveBlocks(notice).map((b) => b.id));
+  for (const r of cmd.refs) {
+    if (!liveIds.has(r.fromBlockId) || !liveIds.has(r.toBlockId))
+      return '引用的区块不存在或已删除，请先恢复或改指有效区块';
+    if (r.fromBlockId === r.toBlockId) return '区块不能引用自身';
+  }
+  notice.refs = cmd.refs.map((r) => ({ ...r }));
+  revalidateReviews(notice);
+  const broken = brokenRefs(notice);
+  R('refs_updated', `区块引用已更新（${notice.refs.length} 条）`, [
+    broken.length ? `仍有 ${broken.length} 条失效引用待修复` : '全部引用均指向有效区块，失效审阅须重新批准',
+  ]);
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// 翻译志愿者：译文与审阅
+// ---------------------------------------------------------------------------
+
+function hSaveTranslation(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'SaveTranslation' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  const block = blockById(notice, cmd.blockId);
+  if (!block || block.deleted) return '区块不存在或已删除';
+  const list = notice.translations[cmd.blockId];
+  let t = list.find((x) => x.lang === cmd.lang);
+  const baseVersion = latestVersion(block);
+  if (!t) {
+    t = { lang: cmd.lang, text: cmd.text, basedOnSourceVersion: baseVersion, editedAt: state.virtualNow };
+    list.push(t);
+  } else {
+    t.text = cmd.text;
+    t.basedOnSourceVersion = baseVersion;
+    t.editedAt = state.virtualNow;
+  }
+  revalidateReviews(notice);
+  R(
+    'translation_saved',
+    `已保存${LANG_LABEL[cmd.lang]}译文：「${kindName(notice, block.id)}」（绑定源文 v${baseVersion}）`,
+    [
+      `译文有效性绑定源文版本 v${baseVersion}，不能只凭译文编辑时间判断；源文再修订后该译文需重新翻译`,
+      translationReady(notice, block.id, cmd.lang) ? '该译文已可进入审阅' : '译文为空，尚不能审阅或发布',
+    ],
+  );
+  return undefined;
+}
+
+function liveVersionMap(notice: Notice): Record<string, number> {
+  const m: Record<string, number> = {};
+  for (const b of liveBlocks(notice)) m[b.id] = latestVersion(b);
+  return m;
+}
+
+function hWholeReview(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'SubmitWholeReview' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (notice.reviewMode !== 'whole') return '该通知采用区块审阅，请逐区块提交审阅';
+  const blocks = liveBlocks(notice);
+  if (!cmd.approve) {
+    R('review_rejected', `${LANG_LABEL[cmd.lang]}整份审阅未通过，已退回修订`, ['未生成批准结论，通知仍不可发布']);
+    return undefined;
+  }
+  // 晚到审阅登记的是旧版快照，到达后凭快照判定失效，不再以当前译文版本前置拦截
+  if (!cmd.asOfVersions) {
+    for (const b of blocks) {
+      if (!translationReady(notice, b.id, cmd.lang))
+        return `「${kindName(notice, b.id)}」缺译或译文未基于最新源文，不能用缺译文本补成已批准`;
+    }
+  }
+  if (brokenRefs(notice).length) return '存在待修复引用，不能批准整份审阅';
+
+  const late = !!cmd.asOfVersions;
+  const versions = cmd.asOfVersions ?? liveVersionMap(notice);
+  const review: Review = {
+    id: uid(),
+    mode: 'whole',
+    lang: cmd.lang,
+    sourceSnapshot: { ...versions },
+    orderSignature: blocks.map((b) => b.id),
+    refSignature: currentRefSignature(notice),
+    status: 'approved',
+    decidedAt: state.virtualNow,
+  };
+  const priorIdx = notice.reviews.findIndex((r) => r.mode === 'whole' && r.lang === cmd.lang);
+  if (priorIdx >= 0) notice.reviews.splice(priorIdx, 1, review);
+  else notice.reviews.push(review);
+  revalidateReviews(notice);
+
+  if (late && review.status === 'stale') {
+    R(
+      'review_late',
+      `${LANG_LABEL[cmd.lang]}整份审阅「晚到」：登记的是旧版快照，到达即失效`,
+      [`失效原因：${review.staleReason}`, '旧审阅不能覆盖当前源文，须按最新版本重新审阅后才能发布'],
+    );
+    return undefined;
+  }
+  R('review_approved', `${LANG_LABEL[cmd.lang]}整份审阅已批准`, [
+    `绑定 ${blocks.length} 个区块源文版本、区块顺序与引用关系；任一区块再修订都须重审整份`,
+  ]);
+  return undefined;
+}
+
+function hBlockReview(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'SubmitBlockReview' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (notice.reviewMode !== 'block') return '该通知采用整份审阅，请提交整份审阅';
+  const block = blockById(notice, cmd.blockId);
+  if (!block || block.deleted) return '区块不存在或已删除';
+  if (!cmd.approve) {
+    R('review_rejected', `${LANG_LABEL[cmd.lang]}区块审阅未通过：「${kindName(notice, block.id)}」已退回`, [
+      '未生成批准结论',
     ]);
     return undefined;
   }
+  // 晚到审阅登记旧版快照、到达即失效，不以当前译文版本前置拦截
+  if (!cmd.asOfVersions) {
+    if (!translationReady(notice, block.id, cmd.lang))
+      return '该区块译文缺失或未基于最新源文，不能用缺译文本补成已批准';
+  }
+  const out = outgoingRefs(notice, block.id);
+  if (out.some((r) => brokenRefs(notice).some((br) => br.fromBlockId === r.fromBlockId && br.toBlockId === r.toBlockId)))
+    return '本区块存在待修复引用，修复前不能批准';
 
-  // 容量保护：家庭须事先同意返所换房
-  if (!fam.consentRoomChange) return '该家庭未事先同意返所换房，不能采用容量保护策略';
-  if (!cmd.protectionRoomId) return '请选择用于返所安排的保护房间';
-  const proom = roomById(state, cmd.protectionRoomId);
-  if (proom.id === originRoom.id) return '容量保护需选择不同房间；如需留在原房请选择「原房原床保留」';
-  const issues = eligibility(state, fam, proom);
-  if (issues.length) return `保护房间资格核验未通过：${issues.join('；')}`;
-  endActive('暂离（容量保护，释放原房）');
-  const p: ReturnPromise = {
+  const snapshot: Record<string, number> = {};
+  snapshot[block.id] = cmd.asOfVersions?.[block.id] ?? latestVersion(block);
+  for (const ref of out) {
+    const target = blockById(notice, ref.toBlockId)!;
+    snapshot[target.id] = cmd.asOfVersions?.[target.id] ?? latestVersion(target);
+  }
+  const review: Review = {
     id: uid(),
-    familyId: fam.id,
-    strategy: 'capacity',
-    roomId: proom.id,
-    originRoomId: originRoom.id,
-    beds: fam.size,
-    expectedReturnAt: cmd.expectedReturnAt,
-    status: 'active',
-    createdAt: state.virtualNow,
+    mode: 'block',
+    lang: cmd.lang,
+    scopeBlockId: block.id,
+    sourceSnapshot: snapshot,
+    orderSignature: liveBlocks(notice).map((b) => b.id),
+    refSignature: refSignature(out),
+    status: 'approved',
+    decidedAt: state.virtualNow,
   };
-  state.promises.push(p);
-  fam.status = 'temp_leave';
-  fam.currentRoomId = undefined;
-  R('leave_registered', `暂离登记：${fam.name}（${fam.size}人）外出，预计 ${fmtTime(cmd.expectedReturnAt)} 返所`, [
-    `家庭已同意返所换房：原${originRoom.name}房床位已释放，已在${proom.name}房保护 ${fam.size} 床作为返所安排`,
-    `返所时将安排至${proom.name}房，须向返所家庭说明新房`,
+  const priorIdx = notice.reviews.findIndex(
+    (r) => r.mode === 'block' && r.scopeBlockId === block.id && r.lang === cmd.lang,
+  );
+  if (priorIdx >= 0) notice.reviews.splice(priorIdx, 1, review);
+  else notice.reviews.push(review);
+  revalidateReviews(notice);
+
+  if (cmd.asOfVersions && review.status === 'stale') {
+    R(
+      'review_late',
+      `${LANG_LABEL[cmd.lang]}区块审阅「晚到」：「${kindName(notice, block.id)}」登记的是旧版快照，到达即失效`,
+      [`失效原因：${review.staleReason}`, '依赖版本已变化，旧审阅不能复活，须按当前版本重审'],
+    );
+    return undefined;
+  }
+  R('review_approved', `${LANG_LABEL[cmd.lang]}区块审阅已批准：「${kindName(notice, block.id)}」`, [
+    out.length
+      ? `同时绑定依赖区块版本：${out.map((r) => kindName(notice, r.toBlockId)).join('、')}；依赖源文修订将连带令本审阅失效`
+      : '该区块无外发引用，可独立理解与沿用',
   ]);
   return undefined;
 }
 
-function hConfirmReturn(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'ConfirmReturn' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'temp_leave') return '家庭不处于暂离状态';
-  if (pendingOf(state, fam.id, 'checkout')) return '退住核实进行中，无法办理返所';
-  const p = activePromiseOf(state, fam.id);
-  if (!p) return '无有效返所承诺（可能已被核实退住）';
-  const room = roomById(state, p.roomId);
-  if (room.status !== 'open') return `保护房间${room.name}已临时关闭，请先由床位管理员重开或调整保护安排`;
-  const origin = roomById(state, p.originRoomId);
-  state.assignments.push({
-    id: uid(),
-    familyId: fam.id,
-    roomId: room.id,
-    beds: fam.size,
-    kind: 'checkin',
-    status: 'active',
-    createdAt: state.virtualNow,
-    confirmedAt: state.virtualNow,
-  });
-  fam.status = 'checked_in';
-  fam.currentRoomId = room.id;
-  p.status = 'fulfilled';
-  p.fulfilledAt = state.virtualNow;
-  const task = openTaskOf(state, fam.id);
-  if (task) {
-    task.status = 'resolved';
-    task.resolution = '家庭已返所';
-    task.resolvedAt = state.virtualNow;
-  }
-  const lines =
-    p.strategy === 'capacity'
-      ? [
-          `返所换房说明：原${origin.name}房 → 现${room.name}房（家庭事先已同意返所换房），请向返所家庭说明新房位置`,
-          `保护床位 ${p.beds} 床已转为实际在场`,
-        ]
-      : [`返回原房${room.name}原床 ${p.beds} 床，承诺已兑现`];
-  R('return_confirmed', `返所确认：${fam.name}（${fam.size}人）已回到${room.name}房`, lines);
-  return undefined;
-}
+// ---------------------------------------------------------------------------
+// 值班负责人：发布 / 撤回
+// ---------------------------------------------------------------------------
 
-function hExtendPromise(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'ExtendPromise' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  const p = activePromiseOf(state, fam.id);
-  if (!p) return '无有效返所承诺';
-  if (cmd.newExpectedReturnAt <= state.virtualNow) return '新的预计返所时间须晚于当前演示时间';
-  const wasExpired = p.status === 'expired_contact';
-  p.expectedReturnAt = cmd.newExpectedReturnAt;
-  p.status = 'active';
-  const task = openTaskOf(state, fam.id);
-  if (task) {
-    task.status = 'resolved';
-    task.resolution = `已延期至 ${fmtTime(cmd.newExpectedReturnAt)}`;
-    task.resolvedAt = state.virtualNow;
-  }
-  R('promise_extended', `返所承诺已延期：${fam.name} → 预计 ${fmtTime(cmd.newExpectedReturnAt)} 返所`, [
-    wasExpired ? '逾期联系任务已随之解决，床位继续保护' : '床位继续保护',
-  ]);
-  return undefined;
-}
-
-function hSubmitCheckout(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'SubmitCheckout' }>,
+function hPublish(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'Publish' }>,
   ctx: CmdCtx,
   R: ReceiptSink,
 ): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'checked_in' && fam.status !== 'temp_leave')
-    return '仅在住或暂离家庭可办理退住';
-  if (pendingOf(state, fam.id, 'checkout')) return '退住核实已在进行中';
-  if (pendingOf(state, fam.id, 'checkin')) return '入住确认进行中，无法同时退住';
-  state.pending.push({
-    id: uid(),
-    kind: 'checkout',
-    familyId: fam.id,
-    submittedAtReal: ctx.realNow,
-    resolveAtReal: ctx.realNow + CHECKOUT_DELAY_REAL_MS,
-    atVirtual: state.virtualNow,
-    actor: ctx.role,
-  });
-  R(
-    'checkout_submitted',
-    `退住核实已提交：${fam.name}`,
-    ['楼层值班员核实中（本地模拟适配器异步确认）；核实完成后结束返所权并释放床位'],
-    { pending: true },
-  );
-  return undefined;
-}
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (isPublishedNow(notice)) return '通知已处于发布状态，不能重复发布';
+  const check = releaseCheck(state, notice);
+  if (!check.canPublish)
+    return `发布完整性校验未通过（${check.issues.length} 项）：\n${check.issues.map((i) => `· [${i.scope}] ${i.detail}`).join('\n')}`;
 
-function hAddTaskNote(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'AddTaskNote' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const t = state.contactTasks.find((x) => x.id === cmd.taskId);
-  if (!t || t.status !== 'open') return '联系任务不存在或已解决';
-  if (!cmd.note.trim()) return '备注不能为空';
-  t.notes.push(`${fmtDateTime(state.virtualNow)} ${cmd.note.trim()}`);
-  const fam = familyById(state, t.familyId);
-  R('task_note', `联系任务备注：${fam.name}`, [cmd.note.trim()]);
-  return undefined;
-}
+  const blocks = liveBlocks(notice);
+  const pubVersion = (currentPublication(notice)?.version ?? 0) + 1;
+  const recipients = targetResidents(state, notice);
+  const blockVersions: Record<string, number> = {};
+  for (const b of blocks) blockVersions[b.id] = latestVersion(b);
+  const pub: Publication = {
+    version: pubVersion,
+    mode: notice.reviewMode,
+    publishedAt: state.virtualNow,
+    blockVersions,
+    order: blocks.map((b) => b.id),
+    refSignature: currentRefSignature(notice),
+    refs: notice.refs.map((r) => ({ ...r })),
+    recipientResidentIds: recipients.map((r) => r.id),
+  };
+  notice.publications.push(pub);
+  notice.status = 'published';
+  notice.updatedAt = state.virtualNow;
 
-function hCloseRoom(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'CloseRoom' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const room = roomById(state, cmd.roomId);
-  if (room.status === 'closed') return '房间已处于关闭状态';
-  const present = state.families.filter((f) => f.status === 'checked_in' && f.currentRoomId === room.id);
-  if (present.length)
-    return `房间${room.name}尚有在场家庭（${present.map((f) => f.name).join('、')}），已入住家庭不得被自动搬走，无法关闭`;
-  const confirming = state.assignments.filter((a) => a.roomId === room.id && a.status === 'confirming');
-  if (confirming.length) return `房间${room.name}有入住确认进行中，无法关闭`;
-  const keepPromises = state.promises.filter(
-    (p) => p.roomId === room.id && (p.status === 'active' || p.status === 'expired_contact') && p.strategy === 'keep_room',
-  );
-  if (keepPromises.length)
-    return `房间${room.name}存在「原房原床」返所承诺（${keepPromises
-      .map((p) => familyById(state, p.familyId).name)
-      .join('、')}），相关家庭未选择换房，关闭将无法兑现返所权`;
-
-  // 容量保护承诺：尝试整组迁移到其他房间（保护可迁移，已入住家庭不可迁移）
-  const capPromises = state.promises.filter(
-    (p) => p.roomId === room.id && (p.status === 'active' || p.status === 'expired_contact') && p.strategy === 'capacity',
-  );
-  const extra: Record<string, number> = {};
-  const moves: { p: ReturnPromise; to: Room }[] = [];
-  for (const p of capPromises) {
-    const fam = familyById(state, p.familyId);
-    const candidates = state.rooms
-      .filter((r) => r.id !== room.id && r.status === 'open')
-      .map((r) => ({ r, issues: eligibility(state, fam, r, extra) }))
-      .filter((x) => x.issues.length === 0)
-      .sort((a, b) => roomBuckets(state, b.r.id).allocatable - roomBuckets(state, a.r.id).allocatable);
-    if (!candidates.length)
-      return `无法关闭：返所承诺无法整组兑现——${fam.name}需${p.beds}床${fam.needsAccessible ? '（需无障碍）' : ''}，其他房间均不满足；房间保持开放`;
-    const to = candidates[0].r;
-    extra[to.id] = (extra[to.id] ?? 0) + p.beds;
-    moves.push({ p, to });
+  // 本地模拟适配器入队（短信桩），不调用真实短信服务
+  for (const resident of recipients) {
+    state.deliveries.push({
+      id: uid(),
+      noticeId: notice.id,
+      publicationVersion: pubVersion,
+      residentId: resident.id,
+      lang: resident.preferredLang,
+      channel: 'sms_stub',
+      status: 'queued',
+      queuedAt: state.virtualNow,
+      resolveAtReal: ctx.realNow + DELIVERY_DELAY_REAL_MS,
+      detail: `本地模拟短信：向${resident.name}（${LANG_LABEL[resident.preferredLang]}）投递发布版 v${pubVersion}`,
+    });
   }
-  for (const m of moves) m.p.roomId = m.to.id;
-  room.status = 'closed';
-  room.closedReason = cmd.reason || '临时关闭';
-  const lines: string[] = [];
-  for (const m of moves)
-    lines.push(
-      `返所保护迁移：${familyById(state, m.p.familyId).name} ${m.p.beds}床 → ${m.to.name}房（返所时须向家庭说明新房）`,
+
+  R('notice_published', `通知「${notice.title}」已发布 v${pubVersion}（${notice.reviewMode === 'whole' ? '整份审阅' : '区块审阅'}组合）`, [
+    `发布版固定区块源文版本、顺序、引用与投递名单（${recipients.length} 名在住对象）`,
+    `已通过本地模拟适配器入队 ${recipients.length} 条短信桩投递（约 ${DELIVERY_DELAY_REAL_MS / 1000} 秒后标记送达），不调用真实短信服务`,
+    '注意：发布数量 ≠ 实际收悉人数；须等待住户逐人确认知悉，收悉缺口另行统计',
+  ]);
+  return undefined;
+}
+
+function hWithdraw(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'Withdraw' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+  if (!isPublishedNow(notice)) return '仅已发布且未撤回的通知可撤回';
+  const pub = currentPublication(notice)!;
+  pub.withdrawnAt = state.virtualNow;
+  notice.status = 'withdrawn';
+  notice.updatedAt = state.virtualNow;
+  R('notice_withdrawn', `通知「${notice.title}」v${pub.version} 已撤回`, [
+    '居民入口不再展示该通知；撤回后住户才点击的确认将被拒绝并单独留痕，不计入收悉',
+    '撤回前已记录的收悉/协助回复原样保留，可按发布版本追溯出处',
+  ]);
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// 住户：确认知悉 / 请求协助
+// ---------------------------------------------------------------------------
+
+function hResidentAck(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'ResidentAck' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const resident = residentById(state, cmd.residentId);
+  if (!resident) return '住户不存在';
+  const notice = getNotice(state, cmd.noticeId);
+  if (!notice) return '通知不存在';
+
+  const reject = (reason: string): string => {
+    const pub = currentPublication(notice);
+    const rec: RejectedClick = {
+      id: uid(),
+      residentId: resident.id,
+      noticeId: notice.id,
+      publicationVersion: pub?.version ?? 0,
+      at: state.virtualNow,
+      reason,
+    };
+    state.rejectedClicks.push(rec);
+    R('ack_rejected', `${resident.name} 的确认被拒绝：${reason}`, ['该次点击已留痕，但不计入收悉统计']);
+    return reason;
+  };
+
+  if (resident.status === 'moved_out')
+    return reject('该家庭已迁出，不再接收新安排（此前回复仍保留出处）');
+  if (!isPublishedNow(notice))
+    return reject('通知已撤回或尚未发布，当前为无效安排，确认不予记录');
+  const pub = currentPublication(notice)!;
+  if (!pub.recipientResidentIds.includes(resident.id))
+    return reject('您不在该通知的投递名单内');
+
+  const dup = state.acknowledgements.find(
+    (a) => a.residentId === resident.id && a.noticeId === notice.id && a.publicationVersion === pub.version,
+  );
+  if (dup) {
+    R(
+      'ack_duplicate',
+      `${resident.name} 对 v${pub.version} 的重复确认已幂等忽略`,
+      ['同一发布版本在两个标签页重复确认仅记一次；较早的确认仍为唯一有效记录'],
+      { duplicateOf: dup.id },
     );
-  for (const d of state.assignments.filter((a) => a.roomId === room.id && a.status === 'draft_open')) {
-    d.status = 'draft_stale';
-    d.conflictReason = `房间${room.name}已临时关闭`;
-    const f = familyById(state, d.familyId);
-    if (f.status === 'draft') f.status = 'registered';
-    lines.push(`草稿失效：${f.name} → ${room.name}房（输入已保留）`);
+    return undefined;
   }
-  R('room_closed', `房间${room.name}已临时关闭（${room.closedReason}）`, lines);
+
+  const ack: Acknowledgement = {
+    id: uid(),
+    residentId: resident.id,
+    noticeId: notice.id,
+    publicationVersion: pub.version,
+    kind: cmd.kind,
+    noticeStatusAtClick: 'published',
+    residentStatusAtClick: resident.status,
+    assistNote: cmd.kind === 'assist' ? cmd.assistNote?.trim() || '住户请求协助，请值班负责人联系' : undefined,
+    at: state.virtualNow,
+  };
+  state.acknowledgements.push(ack);
+  if (cmd.kind === 'assist') {
+    R(
+      'assist_submitted',
+      `${resident.name} 对「${notice.title}」v${pub.version} 提交协助请求`,
+      [ack.assistNote ?? '', '已进入协助待办，收悉统计中该住户记为已回应（协助），与普通知悉区分'],
+    );
+  } else {
+    R('ack_recorded', `${resident.name} 已确认知悉「${notice.title}」v${pub.version}`, [
+      '确认绑定具体发布版本；通知再发布新版本后，旧确认不会自动算作知悉新内容',
+    ]);
+  }
   return undefined;
 }
 
-function hReopenRoom(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'ReopenRoom' }>,
+function hMoveOut(
+  state: NoticeState,
+  cmd: Extract<Command, { type: 'MoveOutFamily' }>,
   R: ReceiptSink,
 ): string | undefined {
-  const room = roomById(state, cmd.roomId);
-  if (room.status !== 'closed') return '房间未处于关闭状态';
-  room.status = 'open';
-  room.closedReason = undefined;
-  R('room_reopened', `房间${room.name}已重新开放`, ['返所保护不自动迁回，保持当前承诺安排']);
+  const family = state.families.find((f) => f.id === cmd.familyId);
+  if (!family) return '家庭不存在';
+  const members = state.residents.filter((r) => r.familyId === family.id);
+  if (members.every((m) => m.status === 'moved_out')) return '该家庭已全部迁出';
+  let n = 0;
+  for (const m of members) {
+    if (m.status === 'living') {
+      m.status = 'moved_out';
+      m.movedOutAt = state.virtualNow;
+      n++;
+    }
+  }
+  R('family_moved_out', `家庭「${family.name}」已迁出（${n} 人）`, [
+    '此后新发布的安排不再向其投递（投递名单按在住对象生成）',
+    '该家庭此前的收悉/协助回复原样保留，仍可按发布版本追溯出处',
+  ]);
   return undefined;
 }
 
-function hAdvanceClock(
-  state: ShelterState,
+function hAdvance(
+  state: NoticeState,
   cmd: Extract<Command, { type: 'AdvanceClock' }>,
   R: ReceiptSink,
 ): string | undefined {
   if (cmd.toVirtual <= state.virtualNow) return '演示时间只能向前推进';
   state.virtualNow = cmd.toVirtual;
-  R('clock_advanced', `演示时间推进至 ${fmtDateTime(cmd.toVirtual)}`, []);
-  // 到期未归：只产生联系核实任务，不自动认定退住，床位继续保护
-  for (const p of state.promises.filter(
-    (x) => x.status === 'active' && x.expectedReturnAt < state.virtualNow,
-  )) {
-    p.status = 'expired_contact';
-    const fam = familyById(state, p.familyId);
-    state.contactTasks.push({
-      id: uid(),
-      familyId: fam.id,
-      promiseId: p.id,
-      createdAt: state.virtualNow,
-      status: 'open',
-      notes: [],
-    });
-    R('promise_expired', `返所承诺到期未归：${fam.name}（约定 ${fmtTime(p.expectedReturnAt)} 返所）`, [
-      '已生成联系核实任务；按规则不自动认定退住，床位继续保护，返所权保持有效',
-    ]);
-  }
+  R('clock_advanced', `演示时间推进至 ${fmtDateTime(cmd.toVirtual)}`);
   return undefined;
 }
 
-function hFinalizeDue(state: ShelterState, ctx: CmdCtx, R: ReceiptSink): string | undefined {
-  const due = state.pending.filter((p) => p.resolveAtReal <= ctx.realNow);
-  for (const p of due) {
-    state.pending.splice(state.pending.indexOf(p), 1);
-    if (p.kind === 'checkin') finalizeCheckin(state, p, R);
-    else finalizeCheckout(state, p, R);
+/** 本地模拟适配器：把到期的排队投递标记为送达 */
+function hSweep(state: NoticeState, ctx: CmdCtx, R: ReceiptSink): string | undefined {
+  const due = state.deliveries.filter((d) => d.status === 'queued' && d.resolveAtReal <= ctx.realNow);
+  for (const d of due) {
+    d.status = 'delivered';
+    d.deliveredAt = ctx.realNow;
+    d.detail = `${d.detail}；已由本地模拟适配器标记送达（无真实短信发出）`;
   }
+  if (due.length) R('delivery_swept', `模拟投递结算：${due.length} 条标记为送达`, ['仅本地状态演示，不调用真实短信服务']);
   return undefined;
 }
 
-function finalizeCheckin(state: ShelterState, p: PendingConfirmation, R: ReceiptSink): void {
-  const a = state.assignments.find((x) => x.id === p.assignmentId);
-  if (!a || a.status !== 'confirming') return; // 多标签重复结算的幂等保护
-  const fam = familyById(state, p.familyId);
-  const room = roomById(state, a.roomId);
-  if (room.status !== 'open') {
-    a.status = 'draft_stale';
-    a.conflictReason = `房间${room.name}已临时关闭`;
-    fam.status = 'registered';
-    R('checkin_failed', `入住确认失败：${fam.name} → ${room.name}房`, [
-      `冲突原因：${a.conflictReason}`,
-      '草稿输入已保留，可修改后重试',
-    ]);
-    return;
-  }
-  a.status = 'active';
-  a.confirmedAt = state.virtualNow;
-  fam.status = 'checked_in';
-  fam.currentRoomId = room.id;
-  R('checkin_confirmed', `现场入住确认完成：${fam.name}（${fam.size}人）入住${room.name}房`, [
-    '已计入实际在场人数',
-  ]);
+// ---------------------------------------------------------------------------
+// 不变量核对（UI 工作台实时展示）
+// ---------------------------------------------------------------------------
+
+export interface InvariantResult {
+  name: string;
+  ok: boolean;
+  detail: string;
 }
 
-function finalizeCheckout(state: ShelterState, p: PendingConfirmation, R: ReceiptSink): void {
-  const fam = familyById(state, p.familyId);
-  if (fam.status === 'checked_out') return; // 幂等保护
-  const a = state.assignments.find((x) => x.familyId === fam.id && x.status === 'active');
-  if (a) {
-    a.status = 'ended';
-    a.endedAt = state.virtualNow;
-    a.endReason = '核实退住';
-  }
-  const prom = activePromiseOf(state, fam.id);
-  if (prom) {
-    prom.status = 'cancelled';
-    prom.cancelledAt = state.virtualNow;
-  }
-  fam.status = 'checked_out';
-  fam.currentRoomId = undefined;
-  const task = openTaskOf(state, fam.id);
-  if (task) {
-    task.status = 'resolved';
-    task.resolution = '已核实退住';
-    task.resolvedAt = state.virtualNow;
-  }
-  R('checkout_confirmed', `退住核实完成：${fam.name}`, [
-    '返所权已结束，占用/保护床位已释放，住宿关系终止',
-  ]);
-}
+export function checkInvariants(state: NoticeState): InvariantResult[] {
+  const results: InvariantResult[] = [];
 
-/** 每次变更后重核有效草稿：失效的标记冲突原因并保留输入 */
-function revalidateDrafts(state: ShelterState, R: ReceiptSink): void {
-  for (const a of state.assignments.filter((x) => x.status === 'draft_open')) {
-    const fam = familyById(state, a.familyId);
-    const room = roomById(state, a.roomId);
-    const issues = eligibility(state, fam, room);
-    if (issues.length) {
-      a.status = 'draft_stale';
-      a.conflictReason = issues.join('；');
-      if (fam.status === 'draft') fam.status = 'registered';
-      R('draft_stale', `草稿失效：${fam.name} → ${room.name}房`, [
-        `冲突原因：${a.conflictReason}`,
-        '草稿输入已保留，可修改后重试',
-      ]);
+  // 1. 当前发布中的通知，其发布版必须三语言齐备且审阅有效（不能用缺译补成已批准）
+  const badRelease: string[] = [];
+  for (const n of state.notices) {
+    if (isPublishedNow(n) && !releaseCheck(state, n).canPublish) badRelease.push(n.title);
+  }
+  results.push({
+    name: '发布完整性',
+    ok: badRelease.length === 0,
+    detail: badRelease.length ? `发布中却不完整：${badRelease.join('、')}` : '所有发布中的通知均满足「全部必需语言 × 全部区块」译文齐备且审阅有效',
+  });
+
+  // 2. 同一住户对同一发布版本至多一条收悉记录（重复确认幂等）
+  const keyCount = new Map<string, number>();
+  for (const a of state.acknowledgements) {
+    const k = `${a.residentId}|${a.noticeId}|${a.publicationVersion}`;
+    keyCount.set(k, (keyCount.get(k) ?? 0) + 1);
+  }
+  const dup = [...keyCount.entries()].filter(([, c]) => c > 1);
+  results.push({
+    name: '收悉幂等',
+    ok: dup.length === 0,
+    detail: dup.length ? `存在重复收悉：${dup.map(([k]) => k).join('、')}` : '同一住户对同一发布版本仅一条收悉/协助记录',
+  });
+
+  // 3. 收悉人数不超过投递名单，且收悉绑定的版本真实存在
+  const badAck: string[] = [];
+  for (const n of state.notices) {
+    for (const pub of n.publications) {
+      const acks = state.acknowledgements.filter((a) => a.noticeId === n.id && a.publicationVersion === pub.version);
+      const ids = new Set(acks.map((a) => a.residentId));
+      if (ids.size > pub.recipientResidentIds.length) badAck.push(`${n.title} v${pub.version}`);
+      for (const id of ids) if (!pub.recipientResidentIds.includes(id)) badAck.push(`${n.title} v${pub.version} 含名单外住户`);
     }
   }
+  results.push({
+    name: '收悉口径 ≤ 投递口径',
+    ok: badAck.length === 0,
+    detail: badAck.length ? badAck.join('；') : '发布数量不等于收悉人数；每条收悉都能回溯到发布版投递名单',
+  });
+
+  // 4. 未发布通知允许有待修复引用，但发布中的通知引用必须闭合
+  const refBad: string[] = [];
+  for (const n of state.notices) {
+    if (isPublishedNow(n) && brokenRefs(n).length) refBad.push(n.title);
+  }
+  results.push({
+    name: '引用闭合',
+    ok: refBad.length === 0,
+    detail: refBad.length ? `发布中存在失效引用：${refBad.join('、')}` : '发布中的通知不存在悬空/残缺引用；删除被引用块会在发布前拦截',
+  });
+
+  // 5. 迁出居民不出现在任何新发布版的投递名单中（名单生成之后迁出的历史版本除外）
+  const moveBad: string[] = [];
+  for (const n of state.notices) {
+    const latest = currentPublication(n);
+    if (!latest) continue;
+    for (const id of latest.recipientResidentIds) {
+      const r = state.residents.find((x) => x.id === id);
+      if (r && r.status === 'moved_out' && (r.movedOutAt ?? 0) < latest.publishedAt) moveBad.push(r.name);
+    }
+  }
+  results.push({
+    name: '迁出不投递',
+    ok: moveBad.length === 0,
+    detail: moveBad.length ? `迁出后仍进入投递名单：${moveBad.join('、')}` : '迁出家庭不再接收新安排；其历史回复保留出处',
+  });
+
+  return results;
 }

@@ -4,11 +4,11 @@ import { readState, transact } from './store';
 
 /**
  * WebWorker：所有写操作都经过「IndexedDB 事务 + 领域引擎」管线，
- * 计算与持久化均在本地完成，不依赖任何后端。
+ * 计算与持久化均在本地完成，不依赖任何后端，也不调用真实短信服务。
  *
- * 异步确认（入住确认、退住核实）由本地模拟适配器承担：命令先落库为
- * PendingConfirmation（带真实时间戳的应结算时刻），worker 内的定时清扫
- * 在到期后于新事务中结算。刷新或换标签页后，任一 worker 启动即补结算。
+ * 通知投递由本地模拟适配器承担：发布时入队 DeliveryRecord（带真实时间戳的
+ * 应送达时刻），worker 内定时清扫在到期后于新事务中标记「送达」。刷新或换
+ * 标签页后，任一 worker 启动即补结算。
  */
 
 interface WorkerScope {
@@ -17,7 +17,7 @@ interface WorkerScope {
 }
 const ctx = self as unknown as WorkerScope;
 
-const bc = new BroadcastChannel('shelter-workbench');
+const bc = new BroadcastChannel('notice-workbench');
 
 interface CmdResultView {
   ok: boolean;
@@ -40,12 +40,16 @@ async function handleCmd(cmd: Command, role: Role): Promise<CmdResultView> {
   return { ok: !out.error, error: out.error, receipts: out.receipts, changed: out.changed };
 }
 
-/** 本地模拟适配器：结算到期的异步确认单 */
+/** 本地模拟适配器：结算到期的排队投递（仅本地状态，不发真实短信） */
 async function sweep() {
   try {
     const realNow = Date.now();
     const out = await transact((s) => {
-      const r = applyCommand(s, { type: 'FinalizeDue', commandId: `sweep-${realNow}` }, { role: 'receptionist', realNow });
+      const r = applyCommand(
+        s,
+        { type: 'SweepDeliveries', commandId: `sweep-${realNow}` },
+        { role: 'duty', realNow },
+      );
       return r.changed ? { state: r.state, out: r } : { out: r };
     });
     if (out.changed) bc.postMessage({ type: 'invalidate', version: out.state.version });

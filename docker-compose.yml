@@ -1,7 +1,7 @@
 services:
   web:
     build: .
-    image: shelter-bed-workbench
+    image: multilingual-notice-workbench
     ports:
       - "8080:80"
     restart: unless-stopped

@@ -1,104 +1,187 @@
-/** 领域模型类型定义：避难所入住与返所工作台 */
+/**
+ * 领域模型：多语言通知发布与收悉工作台
+ *
+ * 一条通知（Notice）由若干区块（Block）组成，区块之间可登记引用（如「行动说明」
+ * 引用「时间地点」）。源文每次修订产生新版本号；译文按语言独立编辑，译文的有效
+ * 性必须同时绑定「源文版本 + 所依赖区块的源文版本」，不能只看译文编辑时间。
+ *
+ * 审阅有两条路径：
+ * - whole 整份审阅：一次审阅整份多语言通知，任一区块源文变更即整份失效，须重审整份；
+ * - block 区块审阅：以「区块 × 语言」为单位独立审阅，互不影响的译文可沿用，
+ *   但引用失效必须准确传播，发布前检查组合完整可理解。
+ */
 
-/** 操作角色：接待员 / 楼层值班员 / 床位管理员 */
-export type Role = 'receptionist' | 'duty' | 'bed_manager';
+export type Role = 'receptionist' | 'translator' | 'duty' | 'resident';
 
-/** 家庭当前状态（唯一位置口径） */
-export type FamilyStatus =
-  | 'registered' // 已登记，待安置（无床位）
-  | 'draft' // 已有分房草稿（草稿不占床位）
-  | 'confirming' // 入住确认中（已预占，尚未计入实际在场）
-  | 'checked_in' // 在场在住
-  | 'temp_leave' // 暂离在外（持有有效返所承诺）
-  | 'checked_out'; // 已退住
+/** 演示固定三种必需语言 */
+export type Lang = 'zh' | 'en' | 'vi';
 
-export type RoomStatus = 'open' | 'closed';
+export type BlockKind = 'subject' | 'time_place' | 'action';
 
-export type AssignmentStatus =
-  | 'draft_open' // 草稿有效
-  | 'draft_stale' // 草稿失效（保留输入与冲突原因）
-  | 'draft_cancelled'
-  | 'confirming' // 入住确认中
-  | 'active' // 正式入住
-  | 'ended';
+/** 引用关系：from 区块引用 to 区块（行动说明 → 时间地点） */
+export interface BlockRef {
+  fromBlockId: string;
+  toBlockId: string;
+}
 
-export type PromiseStatus =
-  | 'active' // 有效返所承诺
-  | 'fulfilled' // 已兑现（家庭已返所）
-  | 'expired_contact' // 到期未归，联系核实中（不自动退住）
-  | 'cancelled'; // 已取消（核实退住，返所权结束）
+export interface BlockVersion {
+  /** 单调递增的源文版本号，从 1 开始 */
+  version: number;
+  text: string;
+  /** 该版本生效（修订）时的业务时间 */
+  revisedAt: number;
+}
 
-/** 床位保护策略：原房原床保留 / 容量保护（事先同意返所换房） */
-export type ProtectionStrategy = 'keep_room' | 'capacity';
+export interface Block {
+  id: string;
+  kind: BlockKind;
+  /** 显示顺序（支持区块换序） */
+  order: number;
+  /** 逻辑删除：删除后不再进入发布组合，但被引用时会令引用方进入待修复 */
+  deleted: boolean;
+  versions: BlockVersion[];
+}
 
-export interface Room {
+export interface TranslationState {
+  lang: Lang;
+  text: string;
+  /** 译文所基于的本区块源文版本（空译文时为 0） */
+  basedOnSourceVersion: number;
+  editedAt: number;
+}
+
+export type ReviewMode = 'whole' | 'block';
+
+export type ReviewStatus = 'pending' | 'approved' | 'stale';
+
+/**
+ * 审阅记录。
+ * whole 模式：scopeBlockId 为 undefined，覆盖当时整份通知的全部区块；
+ * block 模式：scopeBlockId 指向具体区块，只覆盖该区块。
+ */
+export interface Review {
+  id: string;
+  mode: ReviewMode;
+  lang: Lang;
+  scopeBlockId?: string;
+  /** 批准时绑定的源文版本快照：block → sourceVersion */
+  sourceSnapshot: Record<string, number>;
+  /** 批准时绑定的区块顺序（block id 按 order 排列；换序即令整份审阅失效） */
+  orderSignature: string[];
+  /** 批准时绑定的引用快照：`fromBlockId>toBlockId` 集合 */
+  refSignature: string[];
+  status: ReviewStatus;
+  decidedAt: number;
+  /** 失效原因（stale 时填写，供工作台解释） */
+  staleReason?: string;
+}
+
+export type NoticeStatus = 'draft' | 'published' | 'withdrawn';
+
+export interface Publication {
+  /** 发布版本号，从 1 递增；撤回后再发布产生新版本 */
+  version: number;
+  mode: ReviewMode;
+  publishedAt: number;
+  withdrawnAt?: number;
+  /** 发布时各区块源文版本：block → sourceVersion */
+  blockVersions: Record<string, number>;
+  /** 发布时通知的区块顺序快照（block id 列表） */
+  order: string[];
+  refSignature: string[];
+  /** 发布时的引用登记快照 */
+  refs: BlockRef[];
+  /** 本次发布的在住投递对象（发布后迁出不改变该名单，收悉缺口按此名单统计） */
+  recipientResidentIds: string[];
+}
+
+export interface Notice {
+  id: string;
+  title: string;
+  /** 审阅工作流：whole 整份审阅 / block 区块审阅（创建时确定） */
+  reviewMode: ReviewMode;
+  /** 投递目标：楼栋（building）或具体家庭（family） */
+  targetType: 'building' | 'family';
+  targetId: string;
+  status: NoticeStatus;
+  blocks: Block[];
+  refs: BlockRef[];
+  translations: Record<string, TranslationState[]>; // blockId -> 每语言一条
+  reviews: Review[];
+  publications: Publication[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// 居民与收悉
+// ---------------------------------------------------------------------------
+
+export type ResidentStatus = 'living' | 'moved_out';
+
+export interface Resident {
   id: string;
   name: string;
-  capacity: number;
-  accessible: boolean;
-  status: RoomStatus;
-  closedReason?: string;
-}
-
-export interface Family {
-  id: string;
-  name: string;
-  size: number;
-  needsAccessible: boolean;
-  /** 是否同意与其他家庭共房 */
-  coRoomConsent: boolean;
-  /** 是否事先同意返所时换房（容量保护策略的前提） */
-  consentRoomChange: boolean;
-  status: FamilyStatus;
-  /** 在场/确认中时所在房间 */
-  currentRoomId?: string;
-}
-
-export interface Assignment {
-  id: string;
+  buildingId: string;
   familyId: string;
-  roomId: string;
-  beds: number;
-  kind: 'draft' | 'checkin';
-  status: AssignmentStatus;
-  createdAt: number;
-  confirmedAt?: number;
-  endedAt?: number;
-  endReason?: string;
-  /** 失效草稿的冲突说明（输入保留） */
-  conflictReason?: string;
+  preferredLang: Lang;
+  status: ResidentStatus;
+  movedOutAt?: number;
 }
 
-/** 返所承诺：暂离家庭的床位权利 */
-export interface ReturnPromise {
+export type AcknowledgementKind = 'ack' | 'assist';
+
+export interface Acknowledgement {
   id: string;
-  familyId: string;
-  strategy: ProtectionStrategy;
-  /** 保护床位所在房间（keep_room=原房；capacity=保护房） */
-  roomId: string;
-  /** 暂离前所在房间（用于返所换房说明） */
-  originRoomId: string;
-  beds: number;
-  expectedReturnAt: number;
-  status: PromiseStatus;
-  createdAt: number;
-  fulfilledAt?: number;
-  cancelledAt?: number;
+  residentId: string;
+  noticeId: string;
+  /** 针对的发布版本（同一版本在两标签重复确认仅记一次） */
+  publicationVersion: number;
+  kind: AcknowledgementKind;
+  /** 确认时通知状态（withdrawn 后点击会被拒绝并记录尝试，不计入收悉） */
+  noticeStatusAtClick: NoticeStatus;
+  assistNote?: string;
+  at: number;
+  /** 确认时居民状态，保留出处（迁出后历史回复仍可追溯） */
+  residentStatusAtClick: ResidentStatus;
 }
 
-/** 承诺到期未归产生的联系核实任务（不自动退住） */
-export interface ContactTask {
+/** 撤回后居民才点击确认：被拒绝的尝试，单独留痕 */
+export interface RejectedClick {
   id: string;
-  familyId: string;
-  promiseId: string;
-  createdAt: number;
-  status: 'open' | 'resolved';
-  resolution?: string;
-  resolvedAt?: number;
-  notes: string[];
+  residentId: string;
+  noticeId: string;
+  publicationVersion: number;
+  at: number;
+  reason: string;
 }
 
-/** 操作回执（可推进工作流程） */
+// ---------------------------------------------------------------------------
+// 本地模拟投递适配器（不调用真实短信服务）
+// ---------------------------------------------------------------------------
+
+export type DeliveryChannel = 'sms_stub' | 'notice_board';
+export type DeliveryStatus = 'queued' | 'delivered' | 'failed';
+
+export interface DeliveryRecord {
+  id: string;
+  noticeId: string;
+  publicationVersion: number;
+  residentId: string;
+  lang: Lang;
+  channel: DeliveryChannel;
+  status: DeliveryStatus;
+  queuedAt: number;
+  /** 本地模拟适配器的应送达真实时刻（真实时钟，非虚拟时钟） */
+  resolveAtReal: number;
+  deliveredAt?: number;
+  detail: string;
+}
+
+// ---------------------------------------------------------------------------
+// 回执与命令
+// ---------------------------------------------------------------------------
+
 export interface Receipt {
   seq: number;
   id: string;
@@ -107,22 +190,8 @@ export interface Receipt {
   actor: string;
   summary: string;
   lines: string[];
-  /** 异步确认类回执：已提交、待完成 */
-  pending?: boolean;
   /** 重复提交被幂等忽略时，指向原回执 */
   duplicateOf?: string;
-}
-
-/** 本地模拟适配器的异步确认单 */
-export interface PendingConfirmation {
-  id: string;
-  kind: 'checkin' | 'checkout';
-  familyId: string;
-  assignmentId?: string;
-  submittedAtReal: number;
-  resolveAtReal: number;
-  atVirtual: number;
-  actor: Role;
 }
 
 export interface CommandLogEntry {
@@ -133,36 +202,73 @@ export interface CommandLogEntry {
   receiptIds: string[];
 }
 
-export interface ShelterState {
+export interface NoticeState {
   version: number;
-  /** 演示用虚拟时钟（业务时间，如承诺到期的判定依据） */
+  /** 演示虚拟时钟（业务时间） */
   virtualNow: number;
-  rooms: Room[];
-  families: Family[];
-  assignments: Assignment[];
-  promises: ReturnPromise[];
-  contactTasks: ContactTask[];
+  languages: Lang[];
+  buildings: { id: string; name: string }[];
+  families: { id: string; name: string; buildingId: string }[];
+  residents: Resident[];
+  notices: Notice[];
+  acknowledgements: Acknowledgement[];
+  rejectedClicks: RejectedClick[];
+  deliveries: DeliveryRecord[];
   receipts: Receipt[];
-  pending: PendingConfirmation[];
   commandLog: CommandLogEntry[];
   seqCounter: number;
 }
 
+export interface CreateNoticeInput {
+  title: string;
+  targetType: 'building' | 'family';
+  targetId: string;
+  /** 初始区块（至少 1 个） */
+  blocks: { kind: BlockKind; text: string }[];
+  /** 初始引用，按下标表示：[引用方下标, 被引用方下标] */
+  refIndices: [number, number][];
+}
+
 export type Command =
-  | { type: 'RegisterFamily'; commandId: string; input: { name: string; size: number; needsAccessible: boolean; coRoomConsent: boolean; consentRoomChange: boolean } }
-  | { type: 'CreateDraft'; commandId: string; familyId: string; roomId: string }
-  | { type: 'CancelDraft'; commandId: string; assignmentId: string }
-  | { type: 'SubmitCheckIn'; commandId: string; assignmentId: string }
-  | { type: 'RegisterLeave'; commandId: string; familyId: string; strategy: ProtectionStrategy; protectionRoomId?: string; expectedReturnAt: number }
-  | { type: 'ConfirmReturn'; commandId: string; familyId: string }
-  | { type: 'ExtendPromise'; commandId: string; familyId: string; newExpectedReturnAt: number }
-  | { type: 'SubmitCheckout'; commandId: string; familyId: string }
-  | { type: 'AddTaskNote'; commandId: string; taskId: string; note: string }
-  | { type: 'CloseRoom'; commandId: string; roomId: string; reason: string }
-  | { type: 'ReopenRoom'; commandId: string; roomId: string }
+  | { type: 'CreateNotice'; commandId: string; input: CreateNoticeInput }
+  | { type: 'ReviseBlock'; commandId: string; noticeId: string; blockId: string; text: string }
+  | { type: 'ReorderBlocks'; commandId: string; noticeId: string; orderedBlockIds: string[] }
+  | { type: 'DeleteBlock'; commandId: string; noticeId: string; blockId: string }
+  | { type: 'SetBlockRefs'; commandId: string; noticeId: string; refs: BlockRef[] }
+  | { type: 'SwitchReviewMode'; commandId: string; noticeId: string; mode: ReviewMode }
+  | {
+      type: 'SaveTranslation';
+      commandId: string;
+      noticeId: string;
+      blockId: string;
+      lang: Lang;
+      text: string;
+    }
+  | {
+      type: 'SubmitWholeReview';
+      commandId: string;
+      noticeId: string;
+      lang: Lang;
+      approve: boolean;
+      /** 模拟「旧审阅晚到」：按指定的旧版快照登记，到达后立即被判定失效 */
+      asOfVersions?: Record<string, number>;
+    }
+  | {
+      type: 'SubmitBlockReview';
+      commandId: string;
+      noticeId: string;
+      blockId: string;
+      lang: Lang;
+      approve: boolean;
+      asOfVersions?: Record<string, number>;
+    }
+  | { type: 'Publish'; commandId: string; noticeId: string }
+  | { type: 'Withdraw'; commandId: string; noticeId: string }
+  | { type: 'ResidentAck'; commandId: string; residentId: string; noticeId: string; kind: AcknowledgementKind; assistNote?: string }
+  | { type: 'MoveOutFamily'; commandId: string; familyId: string }
   | { type: 'AdvanceClock'; commandId: string; toVirtual: number }
-  | { type: 'ResetDemo'; commandId: string }
-  | { type: 'FinalizeDue'; commandId: string };
+  | { type: 'SweepDeliveries'; commandId: string }
+  | { type: 'ResetDemo'; commandId: string };
 
 export interface CmdCtx {
   role: Role;
@@ -170,9 +276,8 @@ export interface CmdCtx {
 }
 
 export interface CmdOutcome {
-  state: ShelterState;
+  state: NoticeState;
   receipts: Receipt[];
   error?: string;
-  /** 是否产生了需要持久化/广播的变化 */
   changed: boolean;
 }
